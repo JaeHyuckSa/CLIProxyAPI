@@ -15,6 +15,8 @@ import (
 	"io"
 	"net/http"
 
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
@@ -22,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ClaudeCodeAPIHandler contains the handlers for Claude API endpoints.
@@ -76,6 +79,12 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		return
 	}
 
+	// Sanitize thinking blocks with invalid signatures to prevent
+	// 400 errors from the upstream API. This handles the case where
+	// previous responses (e.g., from a fallback provider) injected
+	// empty or invalid signatures into thinking blocks.
+	rawJSON = sanitizeThinkingSignatures(rawJSON)
+
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if !streamResult.Exists() || streamResult.Type == gjson.False {
@@ -83,6 +92,57 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 	} else {
 		h.handleStreamingResponse(c, rawJSON)
 	}
+}
+
+// sanitizeThinkingSignatures removes thinking blocks with empty/invalid signatures
+// and strips proxy-injected signature fields from tool_use blocks.
+func sanitizeThinkingSignatures(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+
+	modified := false
+	for msgIdx, msg := range messages.Array() {
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		var keepBlocks []interface{}
+		contentModified := false
+
+		for _, block := range content.Array() {
+			blockType := block.Get("type").String()
+			if blockType == "thinking" {
+				sig := block.Get("signature")
+				if !sig.Exists() || sig.Type != gjson.String || strings.TrimSpace(sig.String()) == "" {
+					contentModified = true
+					continue
+				}
+			}
+
+			blockRaw := []byte(block.Raw)
+			if blockType == "tool_use" && block.Get("signature").Exists() {
+				blockRaw, _ = sjson.DeleteBytes(blockRaw, "signature")
+				contentModified = true
+			}
+
+			keepBlocks = append(keepBlocks, json.RawMessage(blockRaw))
+		}
+
+		if contentModified {
+			contentPath := fmt.Sprintf("messages.%d.content", msgIdx)
+			body, _ = sjson.SetBytes(body, contentPath, keepBlocks)
+			modified = true
+		}
+	}
+
+	_ = modified
+	return body
 }
 
 // ClaudeMessages handles Claude-compatible streaming chat completions.
