@@ -3,6 +3,7 @@ package amp
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httputil"
 	"strings"
 	"time"
@@ -14,6 +15,66 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// statusCapturingWriter buffers the response so we can inspect the status code
+// before committing the response to the client. This enables provider-level
+// circuit breaking: when a local provider returns 429 (model_cooldown),
+// we can discard the buffered response and try the fallback path instead.
+type statusCapturingWriter struct {
+	gin.ResponseWriter
+	body       *bytes.Buffer
+	statusCode int
+	committed  bool
+}
+
+func newStatusCapturingWriter(w gin.ResponseWriter) *statusCapturingWriter {
+	return &statusCapturingWriter{
+		ResponseWriter: w,
+		body:           &bytes.Buffer{},
+	}
+}
+
+func (w *statusCapturingWriter) WriteHeader(code int) {
+	w.statusCode = code
+}
+
+func (w *statusCapturingWriter) Write(data []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	return w.body.Write(data)
+}
+
+func (w *statusCapturingWriter) WriteString(s string) (int, error) {
+	return w.Write([]byte(s))
+}
+
+func (w *statusCapturingWriter) Status() int {
+	if w.statusCode == 0 {
+		return http.StatusOK
+	}
+	return w.statusCode
+}
+
+func (w *statusCapturingWriter) isModelCooldown() bool {
+	if w.statusCode != http.StatusTooManyRequests {
+		return false
+	}
+	return gjson.GetBytes(w.body.Bytes(), "error.code").String() == "model_cooldown"
+}
+
+func (w *statusCapturingWriter) flushTo(real gin.ResponseWriter) {
+	if w.committed {
+		return
+	}
+	w.committed = true
+	if w.statusCode != 0 {
+		real.WriteHeader(w.statusCode)
+	}
+	if w.body.Len() > 0 {
+		_, _ = real.Write(w.body.Bytes())
+	}
+}
 
 // AmpRouteType represents the type of routing decision made for an Amp request
 type AmpRouteType string
@@ -75,12 +136,18 @@ func logAmpRouting(routeType AmpRouteType, requestedModel, resolvedModel, provid
 	}
 }
 
+// AuthAvailabilityChecker checks whether a provider has available auths for a model.
+type AuthAvailabilityChecker interface {
+	IsModelAvailable(provider, model string) bool
+}
+
 // FallbackHandler wraps a standard handler with fallback logic to ampcode.com
 // when the model's provider is not available in CLIProxyAPI
 type FallbackHandler struct {
 	getProxy           func() *httputil.ReverseProxy
 	modelMapper        ModelMapper
 	forceModelMappings func() bool
+	authChecker        AuthAvailabilityChecker
 }
 
 // NewFallbackHandler creates a new fallback handler wrapper
@@ -107,6 +174,11 @@ func NewFallbackHandlerWithMapper(getProxy func() *httputil.ReverseProxy, mapper
 // SetModelMapper sets the model mapper for this handler (allows late binding)
 func (fh *FallbackHandler) SetModelMapper(mapper ModelMapper) {
 	fh.modelMapper = mapper
+}
+
+// SetAuthChecker sets the auth availability checker for proactive fallback routing.
+func (fh *FallbackHandler) SetAuthChecker(checker AuthAvailabilityChecker) {
+	fh.authChecker = checker
 }
 
 // WrapHandler wraps a gin.HandlerFunc with fallback logic
@@ -248,35 +320,97 @@ func (fh *FallbackHandler) WrapHandler(handler gin.HandlerFunc) gin.HandlerFunc 
 			providerName = providers[0]
 		}
 
+		tryFallback := func() bool {
+			if !usedMapping {
+				if mappedModel, mappedProviders := resolveMappedModel(); mappedModel != "" {
+					log.Infof("amp provider-fallback: primary provider exhausted for %s, falling back to mapping -> %s", modelName, mappedModel)
+					mappedBody := rewriteModelInRequest(bodyBytes, mappedModel)
+					c.Request.Body = io.NopCloser(bytes.NewReader(mappedBody))
+					c.Set(MappedModelContextKey, mappedModel)
+
+					mappedProviderName := ""
+					if len(mappedProviders) > 0 {
+						mappedProviderName = mappedProviders[0]
+					}
+					logAmpRouting(RouteTypeModelMapping, modelName, mappedModel, mappedProviderName, requestPath)
+
+					rewriter := NewResponseRewriter(c.Writer, modelName)
+					rewriter.suppressThinking = true
+					c.Writer = rewriter
+					filterAntropicBetaHeader(c)
+					handler(c)
+					rewriter.Flush()
+					return true
+				}
+			}
+
+			proxy := fh.getProxy()
+			if proxy != nil {
+				log.Infof("amp provider-fallback: primary provider exhausted for %s, forwarding to ampcode.com", modelName)
+				logAmpRouting(RouteTypeAmpCredits, modelName, "", "", requestPath)
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				proxy.ServeHTTP(c.Writer, c.Request)
+				return true
+			}
+
+			return false
+		}
+
 		if usedMapping {
-			// Log: Model was mapped to another model
 			log.Debugf("amp model mapping: request %s -> %s", normalizedModel, resolvedModel)
 			logAmpRouting(RouteTypeModelMapping, modelName, resolvedModel, providerName, requestPath)
 			rewriter := NewResponseRewriter(c.Writer, modelName)
 			rewriter.suppressThinking = true
 			c.Writer = rewriter
-			// Filter Anthropic-Beta header only for local handling paths
 			filterAntropicBetaHeader(c)
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			handler(c)
 			rewriter.Flush()
 			log.Debugf("amp model mapping: response %s -> %s", resolvedModel, modelName)
 		} else if len(providers) > 0 {
-			// Log: Using local provider (free)
+			// Pre-flight check: if we have an auth checker, verify that at least one
+			// auth is available before calling the handler. This avoids the round-trip
+			// through the handler/conductor/selector when all auths are already in cooldown.
+			if fh.authChecker != nil {
+				allExhausted := true
+				for _, p := range providers {
+					if fh.authChecker.IsModelAvailable(p, normalizedModel) {
+						allExhausted = false
+						break
+					}
+				}
+				if allExhausted {
+					log.Infof("amp provider-preflight: all auths exhausted for model %s (providers: %v), skipping handler", modelName, providers)
+					if tryFallback() {
+						return
+					}
+					// No fallback available — fall through to normal handler path
+				}
+			}
+
 			logAmpRouting(RouteTypeLocalProvider, modelName, resolvedModel, providerName, requestPath)
-			// Wrap with ResponseRewriter for local providers too, because upstream
-			// proxies (e.g. NewAPI) may return a different model name and lack
-			// Amp-required fields like thinking.signature.
-			rewriter := NewResponseRewriter(c.Writer, modelName)
+
+			realWriter := c.Writer
+			capturer := newStatusCapturingWriter(realWriter)
+
+			rewriter := NewResponseRewriter(capturer, modelName)
 			rewriter.suppressThinking = providerName != "claude"
 			c.Writer = rewriter
-			// Filter Anthropic-Beta header only for local handling paths
 			filterAntropicBetaHeader(c)
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			handler(c)
 			rewriter.Flush()
+
+			if capturer.isModelCooldown() {
+				log.Infof("amp provider-circuit-breaker: all auths exhausted for model %s (provider: %s), attempting fallback", modelName, providerName)
+				c.Writer = realWriter
+				if !tryFallback() {
+					capturer.flushTo(realWriter)
+				}
+			} else {
+				capturer.flushTo(realWriter)
+			}
 		} else {
-			// No provider, no mapping, no proxy: fall back to the wrapped handler so it can return an error response
 			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			handler(c)
 		}

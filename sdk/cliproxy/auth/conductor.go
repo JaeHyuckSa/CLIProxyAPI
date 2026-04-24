@@ -2537,6 +2537,40 @@ func (m *Manager) List() []*Auth {
 	return list
 }
 
+// IsModelAvailable checks whether at least one auth is available (not in cooldown)
+// for the given provider and model. This is a lightweight pre-flight check that
+// avoids full request execution — useful for deciding whether to skip to fallback.
+func (m *Manager) IsModelAvailable(provider, model string) bool {
+	if m == nil {
+		return false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	baseModel := model
+	if parsed := thinking.ParseSuffix(model); parsed.ModelName != "" {
+		baseModel = parsed.ModelName
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	now := time.Now()
+	registryRef := registry.GetGlobalRegistry()
+	for _, auth := range m.auths {
+		if auth.Provider != provider || auth.Disabled {
+			continue
+		}
+		if baseModel != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
+			continue
+		}
+		checkModel := m.selectionModelForAuth(auth, model)
+		blocked, _, _ := isAuthBlockedForModel(auth, checkModel, now)
+		if !blocked {
+			return true
+		}
+	}
+	return false
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {
